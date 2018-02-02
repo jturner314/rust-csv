@@ -21,7 +21,7 @@ pub fn deserialize_string_record<'de, D: Deserialize<'de>>(
     record: &'de StringRecord,
     headers: Option<&'de StringRecord>,
 ) -> Result<D, Error> {
-    let mut deser = DeRecordWrap(DeStringRecord {
+    let mut deser = DeRecordWrap::new(DeStringRecord {
         it: record.iter().peekable(),
         headers: headers.map(|r| r.iter()),
         field: 0,
@@ -38,7 +38,7 @@ pub fn deserialize_byte_record<'de, D: Deserialize<'de>>(
     record: &'de ByteRecord,
     headers: Option<&'de ByteRecord>,
 ) -> Result<D, Error> {
-    let mut deser = DeRecordWrap(DeByteRecord {
+    let mut deser = DeRecordWrap::new(DeByteRecord {
         it: record.iter().peekable(),
         headers: headers.map(|r| r.iter()),
         field: 0,
@@ -98,44 +98,121 @@ trait DeRecord<'r> {
     ) -> Result<V::Value, DeserializeError>;
 }
 
-struct DeRecordWrap<T>(T);
+struct DeRecordWrap<T>{
+    inner: T,
+    /// Status of deserializer with respect to variable-sized collections (i.e.
+    /// "seq" or "map" in serde terminology).
+    in_var_size_collection: VarSizeCollecState,
+    /// If a nonscalar is encountered, return this error.
+    error_if_nonscalar: Option<DEK>,
+}
+
+/// Status of deserializer with respect to variable-sized collections (i.e.
+/// "seq" or "map" in serde terminology).
+enum VarSizeCollecState {
+    /// The deserializer has not yet encountered a variable-size collection.
+    Before,
+    /// The deserializer is in a descendant of a variable-size collection.
+    Inside,
+    /// The deserializer entered and exited a variable-size collection.
+    After,
+}
+
+impl<T> DeRecordWrap<T> {
+    fn new(inner: T) -> Self {
+        DeRecordWrap {
+            inner,
+            in_var_size_collection: VarSizeCollecState::Before,
+            error_if_nonscalar: None,
+        }
+    }
+}
+
+impl<'de, T: DeRecord<'de>> DeRecordWrap<T> {
+    fn error_if_after_var_size_collection(&self) -> Result<(), DeserializeError> {
+        if let VarSizeCollecState::After = self.in_var_size_collection {
+            Err(self.error(DEK::Message(
+                "tried to deserialize data after a variable-size collection".into()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn deserialize_fixed_size_collection<F, O>(&mut self, deser: F) -> Result<O, DeserializeError>
+    where
+        F: FnOnce(&mut Self) -> Result<O, DeserializeError>,
+    {
+        if let VarSizeCollecState::After = self.in_var_size_collection {
+            return Err(self.error(DEK::Message(
+                "tried to deserialize a fixed-size collection after another one".into()
+            )));
+        }
+        if let Some(err) = ::std::mem::replace(&mut self.error_if_nonscalar, None) {
+            return Err(self.error(err));
+        }
+        deser(self)
+    }
+
+    fn deserialize_var_size_collection<F, O>(&mut self, deser: F) -> Result<O, DeserializeError>
+    where
+        F: FnOnce(&mut Self) -> Result<O, DeserializeError>,
+    {
+        match self.in_var_size_collection {
+            VarSizeCollecState::After => return Err(self.error(DEK::Message(
+                "tried to deserialize a variable-size collection after another one".into()
+            ))),
+            VarSizeCollecState::Inside => return Err(self.error(DEK::Message(
+                "tried to deserialize a variable-size collection inside another one".into()
+            ))),
+            _ => (),
+        }
+        if let Some(err) = ::std::mem::replace(&mut self.error_if_nonscalar, None) {
+            return Err(self.error(err));
+        }
+        self.in_var_size_collection = VarSizeCollecState::Inside;
+        let result = deser(self);
+        self.in_var_size_collection = VarSizeCollecState::After;
+        result
+    }
+}
 
 impl<'r, T: DeRecord<'r>> DeRecord<'r> for DeRecordWrap<T> {
     #[inline]
     fn has_headers(&self) -> bool {
-        self.0.has_headers()
+        self.inner.has_headers()
     }
 
     #[inline]
     fn next_header(&mut self) -> Result<Option<&'r str>, DeserializeError> {
-        self.0.next_header()
+        self.inner.next_header()
     }
 
     #[inline]
     fn next_header_bytes(
         &mut self,
     ) -> Result<Option<&'r [u8]>, DeserializeError> {
-        self.0.next_header_bytes()
+        self.inner.next_header_bytes()
     }
 
     #[inline]
     fn next_field(&mut self) -> Result<&'r str, DeserializeError> {
-        self.0.next_field()
+        self.inner.next_field()
     }
 
     #[inline]
     fn next_field_bytes(&mut self) -> Result<&'r [u8], DeserializeError> {
-        self.0.next_field_bytes()
+        self.inner.next_field_bytes()
     }
 
     #[inline]
     fn peek_field(&mut self) -> Option<&'r [u8]> {
-        self.0.peek_field()
+        self.inner.peek_field()
     }
 
     #[inline]
     fn error(&self, kind: DeserializeErrorKind) -> DeserializeError {
-        self.0.error(kind)
+        self.inner.error(kind)
     }
 
     #[inline]
@@ -143,13 +220,16 @@ impl<'r, T: DeRecord<'r>> DeRecord<'r> for DeRecordWrap<T> {
         &mut self,
         visitor: V,
     ) -> Result<V::Value, DeserializeError> {
-        self.0.infer_deserialize(visitor)
+        self.inner.infer_deserialize(visitor)
     }
 }
 
 struct DeStringRecord<'r> {
+    /// Iterable over the values in this row.
     it: iter::Peekable<StringRecordIter<'r>>,
+    /// The (optional) headers.
     headers: Option<StringRecordIter<'r>>,
+    /// The index of the field being deserialized (used for error reporting).
     field: u64,
 }
 
@@ -224,8 +304,11 @@ impl<'r> DeRecord<'r> for DeStringRecord<'r> {
 }
 
 struct DeByteRecord<'r> {
+    /// Iterable over the values in this row.
     it: iter::Peekable<ByteRecordIter<'r>>,
+    /// The (optional) headers.
     headers: Option<ByteRecordIter<'r>>,
+    /// The index of the field being deserialized (used for error reporting).
     field: u64,
 }
 
@@ -317,6 +400,7 @@ macro_rules! deserialize_int {
             self,
             visitor: V,
         ) -> Result<V::Value, Self::Error> {
+            self.error_if_after_var_size_collection()?;
             visitor.$visit(
                 self.next_field()?
                     .parse().map_err(|err| self.error(DEK::ParseInt(err)))?)
@@ -329,10 +413,12 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
 {
     type Error = DeserializeError;
 
+    /// Deserializes any scalar, inferring the type.
     fn deserialize_any<V: Visitor<'de>>(
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         self.infer_deserialize(visitor)
     }
 
@@ -340,6 +426,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_bool(
             self.next_field()?
                 .parse().map_err(|err| self.error(DEK::ParseBool(err)))?)
@@ -358,6 +445,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_f32(
             self.next_field()?
                 .parse().map_err(|err| self.error(DEK::ParseFloat(err)))?)
@@ -367,6 +455,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_f64(
             self.next_field()?
                 .parse().map_err(|err| self.error(DEK::ParseFloat(err)))?)
@@ -376,6 +465,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         let field = self.next_field()?;
         let len = field.chars().count();
         if len != 1 {
@@ -390,6 +480,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         self.next_field().and_then(|f| visitor.visit_borrowed_str(f))
     }
 
@@ -397,6 +488,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         self.next_field().and_then(|f| visitor.visit_str(f.into()))
     }
 
@@ -404,6 +496,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         self.next_field_bytes().and_then(|f| {
             visitor.visit_borrowed_bytes(f)
         })
@@ -413,6 +506,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         self.next_field()
             .and_then(|f| visitor.visit_byte_buf(f.as_bytes().to_vec()))
     }
@@ -421,13 +515,22 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         match self.peek_field() {
             None => visitor.visit_none(),
             Some(f) if f.is_empty() => {
                 self.next_field().expect("empty field");
                 visitor.visit_none()
             }
-            Some(_) => visitor.visit_some(self),
+            Some(_) => {
+                let old_err = ::std::mem::replace(
+                    &mut self.error_if_nonscalar,
+                    Some(DEK::Message("encountered nonscalar inside option".into()))
+                );
+                let result = visitor.visit_some(&mut *self);
+                self.error_if_nonscalar = old_err;
+                result
+            }
         }
     }
 
@@ -435,6 +538,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_unit()
     }
 
@@ -443,6 +547,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_unit()
     }
 
@@ -451,6 +556,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_newtype_struct(self)
     }
 
@@ -458,7 +564,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        visitor.visit_seq(self)
+        self.deserialize_var_size_collection(|self_| visitor.visit_seq(self_))
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(
@@ -466,7 +572,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         _len: usize,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        visitor.visit_seq(self)
+        self.deserialize_fixed_size_collection(|self_| visitor.visit_seq(self_))
     }
 
     fn deserialize_tuple_struct<V: Visitor<'de>>(
@@ -475,18 +581,23 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         _len: usize,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        visitor.visit_seq(self)
+        self.deserialize_fixed_size_collection(|self_| visitor.visit_seq(self_))
     }
 
     fn deserialize_map<V: Visitor<'de>>(
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        if !self.has_headers() {
-            visitor.visit_seq(self)
-        } else {
-            visitor.visit_map(self)
-        }
+        self.deserialize_var_size_collection(|self_| {
+            if !self_.has_headers() {
+                visitor.visit_seq(self_)
+            } else {
+                self_.error_if_nonscalar = Some(DEK::Message("encountered nonscalar inside map".into()));
+                let result = visitor.visit_map(&mut *self_);
+                self_.error_if_nonscalar = None;
+                result
+            }
+        })
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -495,11 +606,16 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        if !self.has_headers() {
-            visitor.visit_seq(self)
-        } else {
-            visitor.visit_map(self)
-        }
+        self.deserialize_fixed_size_collection(|self_| {
+            if !self_.has_headers() {
+                visitor.visit_seq(self_)
+            } else {
+                self_.error_if_nonscalar = Some(DEK::Message("encountered nonscalar inside struct".into()));
+                let result = visitor.visit_map(&mut *self_);
+                self_.error_if_nonscalar = None;
+                result
+            }
+        })
     }
 
     fn deserialize_identifier<V: Visitor<'de>>(
@@ -515,6 +631,7 @@ impl<'a, 'de: 'a, T: DeRecord<'de>> Deserializer<'de>
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        self.error_if_after_var_size_collection()?;
         visitor.visit_enum(self)
     }
 
